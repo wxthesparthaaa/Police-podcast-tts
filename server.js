@@ -6,8 +6,12 @@
 // the exact format Telegram's voice-message player needs), stitches the
 // chunks into one continuous audio file with ffmpeg, and returns that file.
 //
-// Make's scenario just needs to: POST the script text here, and feed the
-// binary response straight into Telegram's "Send a Voice Message" module.
+// Make's scenario POSTs the script text here and gets back a JSON
+// { "url": "..." } pointing at the generated audio; Telegram's "Send a
+// Voice Message" module then fetches that URL directly (its "HTTP URL"
+// send option) rather than Make trying to relay raw binary bytes through
+// its own buffer type system — the latter turned out to be unreliable to
+// wire up via a hand-built scenario blueprint.
 
 const express = require('express');
 const axios = require('axios');
@@ -22,6 +26,18 @@ const crypto = require('crypto');
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
+// Render terminates TLS at its edge and forwards plain HTTP internally with
+// an X-Forwarded-Proto header — trust it so req.protocol reports "https"
+// correctly when we build the audio URL below.
+app.set('trust proxy', true);
+
+// In-memory store for generated audio, keyed by job ID. A finished podcast
+// is fetched by Telegram (or by you, for testing) within seconds to a
+// couple of minutes of being generated, so this short-lived, unguessable-ID
+// approach is simpler than dealing with persistent storage — entries are
+// deleted automatically after AUDIO_TTL_MS.
+const audioStore = new Map();
+const AUDIO_TTL_MS = 20 * 60 * 1000; // 20 minutes
 // Accept either a JSON body ({"script": "..."}) or a plain-text body (the
 // script itself, with Content-Type: text/plain) — Make's HTTP module can
 // send raw text directly without needing to hand-build escaped JSON, so
@@ -162,9 +178,19 @@ app.post('/generate-podcast-audio', async (req, res) => {
     const finalBuffer = await fsp.readFile(finalPath);
     console.log(`[${jobId}] done — final audio ${finalBuffer.length} bytes`);
 
-    res.set('Content-Type', 'audio/ogg');
-    res.set('Content-Disposition', 'inline; filename="police-buddy-podcast.ogg"');
-    res.send(finalBuffer);
+    if (req.query.raw === '1') {
+      // Manual-testing shortcut: return the audio bytes directly instead of
+      // a URL, e.g. for `curl ... | mpv -` style checks.
+      res.set('Content-Type', 'audio/ogg');
+      res.set('Content-Disposition', 'inline; filename="police-buddy-podcast.ogg"');
+      return res.send(finalBuffer);
+    }
+
+    audioStore.set(jobId, finalBuffer);
+    setTimeout(() => audioStore.delete(jobId), AUDIO_TTL_MS).unref();
+
+    const audioUrl = `${req.protocol}://${req.get('host')}/audio/${jobId}.ogg`;
+    res.json({ url: audioUrl, bytes: finalBuffer.length });
   } catch (err) {
     console.error(`[${jobId}] failed:`, err.response?.data?.toString?.() || err.message);
     res.status(502).json({ error: 'TTS generation failed', detail: err.message });
@@ -174,6 +200,16 @@ app.post('/generate-podcast-audio', async (req, res) => {
       fs.promises.unlink(p).catch(() => {});
     }
   }
+});
+
+app.get('/audio/:id.ogg', (req, res) => {
+  const buffer = audioStore.get(req.params.id);
+  if (!buffer) {
+    return res.status(404).json({ error: 'Not found — audio may have already expired (20 minute lifetime) or the job ID is wrong' });
+  }
+  res.set('Content-Type', 'audio/ogg');
+  res.set('Content-Length', buffer.length);
+  res.send(buffer);
 });
 
 const PORT = process.env.PORT || 3000;
