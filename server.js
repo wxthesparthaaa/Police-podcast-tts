@@ -22,7 +22,12 @@ const crypto = require('crypto');
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
+// Accept either a JSON body ({"script": "..."}) or a plain-text body (the
+// script itself, with Content-Type: text/plain) — Make's HTTP module can
+// send raw text directly without needing to hand-build escaped JSON, so
+// that's the simpler path from Make's side. Both are supported here.
 app.use(express.json({ limit: '2mb' }));
+app.use(express.text({ type: '*/*', limit: '2mb' }));
 
 // ---- Configuration (set these as environment variables on Render) ----
 const AZURE_SPEECH_KEY = process.env.AZURE_SPEECH_KEY;
@@ -125,9 +130,10 @@ app.post('/generate-podcast-audio', async (req, res) => {
     return res.status(500).json({ error: 'AZURE_SPEECH_KEY is not configured on the server' });
   }
 
-  const script = (req.body && req.body.script || '').trim();
+  const rawScript = typeof req.body === 'string' ? req.body : (req.body && req.body.script);
+  const script = (rawScript || '').trim();
   if (!script) {
-    return res.status(400).json({ error: 'Missing "script" in request body' });
+    return res.status(400).json({ error: 'Missing script — send it as the raw request body (text/plain) or as {"script": "..."} (application/json)' });
   }
 
   const jobId = crypto.randomBytes(6).toString('hex');
