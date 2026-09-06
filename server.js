@@ -43,6 +43,7 @@ const AUDIO_TTL_MS = 20 * 60 * 1000; // 20 minutes
 // send raw text directly without needing to hand-build escaped JSON, so
 // that's the simpler path from Make's side. Both are supported here.
 app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 app.use(express.text({ type: '*/*', limit: '2mb' }));
 
 // ---- Configuration (set these as environment variables on Render) ----
