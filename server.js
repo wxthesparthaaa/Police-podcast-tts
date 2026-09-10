@@ -54,6 +54,14 @@ const AZURE_TTS_VOICE = process.env.AZURE_TTS_VOICE || 'en-SG-WayneNeural';
 // your Azure free-tier quota. Make will send this back as a header.
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN;
 
+// Default speaking-rate multiplier applied to every generated podcast unless
+// the caller overrides it with a "speed" field. Azure's SSML <prosody rate>
+// attribute accepts a plain multiplier like "1.5" (1.5x the voice's default
+// pace), a relative percentage like "+50%", or a named value like "fast".
+// Override the default via the TTS_DEFAULT_SPEED env var on Render without
+// touching code.
+const DEFAULT_SPEED = process.env.TTS_DEFAULT_SPEED || '1.5';
+
 // Keep each Azure request comfortably under Azure's hard 10-minute-per-request
 // audio cap (which truncates silently if exceeded, no error). ~4000
 // characters is roughly 4-5 minutes of narration at a natural pace, leaving
@@ -69,6 +77,20 @@ function escapeSsml(text) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
+}
+
+// Only allow a safe, narrow shape for the rate attribute before it gets
+// embedded into the SSML XML — a plain number/decimal (multiplier, e.g.
+// "1.5"), an optionally-signed percentage (e.g. "+50%", "-20%"), or one of
+// Azure's named rate keywords. Anything else falls back to DEFAULT_SPEED,
+// so a bad or malicious "speed" field can't inject SSML markup.
+const NAMED_RATES = new Set(['x-slow', 'slow', 'medium', 'fast', 'x-fast', 'default']);
+function sanitizeRate(input) {
+  const value = String(input == null ? '' : input).trim();
+  if (!value) return DEFAULT_SPEED;
+  if (NAMED_RATES.has(value.toLowerCase())) return value.toLowerCase();
+  if (/^[+-]?\d+(\.\d+)?%?$/.test(value)) return value;
+  return DEFAULT_SPEED;
 }
 
 // Greedy sentence-boundary chunking so we never cut a sentence in half
@@ -95,9 +117,11 @@ function chunkScript(script, maxChars) {
   return chunks;
 }
 
-async function synthesizeChunk(text) {
+async function synthesizeChunk(text, rate) {
   const ssml = `<speak version='1.0' xml:lang='en-US'>` +
-    `<voice xml:lang='en-US' name='${AZURE_TTS_VOICE}'>${escapeSsml(text)}</voice>` +
+    `<voice xml:lang='en-US' name='${AZURE_TTS_VOICE}'>` +
+    `<prosody rate='${rate}'>${escapeSsml(text)}</prosody>` +
+    `</voice>` +
     `</speak>`;
 
   const response = await axios.post(AZURE_TTS_ENDPOINT, ssml, {
@@ -135,7 +159,7 @@ async function concatOggFiles(filePaths, outputPath) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, region: AZURE_SPEECH_REGION, voice: AZURE_TTS_VOICE });
+  res.json({ ok: true, region: AZURE_SPEECH_REGION, voice: AZURE_TTS_VOICE, defaultSpeed: DEFAULT_SPEED });
 });
 
 app.post('/generate-podcast-audio', async (req, res) => {
@@ -153,6 +177,11 @@ app.post('/generate-podcast-audio', async (req, res) => {
     return res.status(400).json({ error: 'Missing script — send it as the raw request body (text/plain) or as {"script": "..."} (application/json)' });
   }
 
+  // Optional per-request override of the speaking rate, e.g. "speed": "1.5"
+  // or "speed": "+50%". Falls back to DEFAULT_SPEED (1.5x) when omitted,
+  // missing, or not in a recognized shape.
+  const rate = sanitizeRate(req.body && typeof req.body === 'object' ? req.body.speed : undefined);
+
   const jobId = crypto.randomBytes(6).toString('hex');
   const tmpDir = os.tmpdir();
   const chunkPaths = [];
@@ -160,10 +189,10 @@ app.post('/generate-podcast-audio', async (req, res) => {
 
   try {
     const chunks = chunkScript(script, MAX_CHARS_PER_CHUNK);
-    console.log(`[${jobId}] script length=${script.length} chars, split into ${chunks.length} chunk(s)`);
+    console.log(`[${jobId}] script length=${script.length} chars, split into ${chunks.length} chunk(s), rate=${rate}`);
 
     for (let i = 0; i < chunks.length; i++) {
-      const audioBuffer = await synthesizeChunk(chunks[i]);
+      const audioBuffer = await synthesizeChunk(chunks[i], rate);
       const chunkPath = path.join(tmpDir, `podcast-${jobId}-part${i}.ogg`);
       await fsp.writeFile(chunkPath, audioBuffer);
       chunkPaths.push(chunkPath);
@@ -191,7 +220,7 @@ app.post('/generate-podcast-audio', async (req, res) => {
     setTimeout(() => audioStore.delete(jobId), AUDIO_TTL_MS).unref();
 
     const audioUrl = `${req.protocol}://${req.get('host')}/audio/${jobId}.ogg`;
-    res.json({ url: audioUrl, bytes: finalBuffer.length });
+    res.json({ url: audioUrl, bytes: finalBuffer.length, rate });
   } catch (err) {
     console.error(`[${jobId}] failed:`, err.response?.data?.toString?.() || err.message);
     res.status(502).json({ error: 'TTS generation failed', detail: err.message });
@@ -216,5 +245,5 @@ app.get('/audio/:id.ogg', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Police Buddy podcast TTS service listening on port ${PORT}`);
-  console.log(`Using Azure region: ${AZURE_SPEECH_REGION}, voice: ${AZURE_TTS_VOICE}`);
+  console.log(`Using Azure region: ${AZURE_SPEECH_REGION}, voice: ${AZURE_TTS_VOICE}, default speed: ${DEFAULT_SPEED}`);
 });
